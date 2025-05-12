@@ -1,0 +1,248 @@
+// ULTRA GEOPTIMALISEERDE TEMPERATUURLOGGER - FIXED MACROS
+// Debug uitschakelen + bulk SD writes + 8-bit resolution
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LowPower.h>
+#include <avr/power.h>
+
+// Debug mode (comment uit voor productie)
+#define DEBUG 1
+
+#ifdef DEBUG
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_BEGIN() Serial.begin(9600); delay(1000)
+  #define DEBUG_FLUSH() Serial.flush()
+  #define DEBUG_PRINT_DEC(x, d) Serial.print(x, d)  // Voor decimalen
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_BEGIN()
+  #define DEBUG_FLUSH()
+  #define DEBUG_PRINT_DEC(x, d)
+#endif
+
+// Pin definities
+#define ONE_WIRE_BUS 2
+#define SD_CS_PIN 4
+
+// Sensor setup
+OneWire ow(ONE_WIRE_BUS);
+DallasTemperature temp(&ow);
+RTC_DS1307 rtc;
+
+// Status tracking
+byte status = 0;
+#define RTC_OK    0
+#define TEMP_OK   1  
+#define SD_OK     2
+
+// Bulk write buffer - store measurements before writing to SD
+struct Measurement {
+  unsigned long timestamp;
+  float temperature;
+};
+
+const byte BUFFER_SIZE = 5;  // Store 5 measurements (2.5 hours)
+Measurement measurementBuffer[BUFFER_SIZE];
+byte bufferIndex = 0;
+bool bufferFull = false;
+
+volatile bool alarmTriggered = false;
+
+void setup() {
+  DEBUG_BEGIN();
+  DEBUG_PRINTLN(F("=== Ultra Optimized Logger ==="));
+  
+  // Disable unused peripherals
+  power_adc_disable();
+  power_spi_disable();
+  power_timer1_disable();
+  power_timer2_disable();
+  
+  // Initialize components
+  initializeComponents();
+  
+  DEBUG_PRINTLN(F("Entering sleep mode..."));
+  DEBUG_FLUSH();
+  delay(100);
+}
+
+void loop() {
+  // Take measurement
+  takeMeasurement();
+  
+  // Check if buffer is full or should be flushed
+  if (bufferFull) {
+    flushBufferToSD();
+  }
+  
+  DEBUG_PRINTLN(F("Sleeping..."));
+  DEBUG_FLUSH();
+  
+  // Sleep for 30 minutes
+  enterDeepSleep();
+}
+
+void initializeComponents() {
+  // RTC initialization
+  DEBUG_PRINT(F("RTC... "));
+  Wire.begin();
+  if (rtc.begin()) {
+    bitSet(status, RTC_OK);
+    DEBUG_PRINTLN(F("OK"));
+    
+    if (!rtc.isrunning()) {
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+  } else {
+    DEBUG_PRINTLN(F("FAIL"));
+  }
+  
+  // Temperature sensor initialization
+  DEBUG_PRINT(F("Temp... "));
+  temp.begin();
+  temp.setResolution(8);  // 8-bit resolution = 0.5°C accuracy, ~150ms conversion
+  
+  // Test temperature reading
+  temp.requestTemperatures();
+  delay(200);
+  float testTemp = temp.getTempCByIndex(0);
+  
+  if (testTemp > -100) {
+    bitSet(status, TEMP_OK);
+    DEBUG_PRINT(F("OK "));
+    DEBUG_PRINT_DEC(testTemp, 1);
+    DEBUG_PRINTLN(F("C (8-bit)"));
+  } else {
+    DEBUG_PRINTLN(F("FAIL"));
+  }
+  
+  // SD card initialization
+  DEBUG_PRINT(F("SD... "));
+  power_spi_enable();
+  if (SD.begin(SD_CS_PIN)) {
+    bitSet(status, SD_OK);
+    DEBUG_PRINTLN(F("OK"));
+    
+    // Create header if file doesn't exist
+    File f = SD.open(F("temp.csv"), FILE_WRITE);
+    if (f) {
+      if (f.size() == 0) {
+        f.println(F("# Ultra Optimized Logger"));
+        f.println(F("# Bulk writes every 5 measurements"));
+        f.println(F("Timestamp,Temperature"));
+      }
+      f.close();
+    }
+  } else {
+    DEBUG_PRINTLN(F("FAIL"));
+  }
+  power_spi_disable();
+  
+  // Status summary
+  DEBUG_PRINT(F("Status: "));
+  if (bitRead(status, RTC_OK)) DEBUG_PRINT(F("R "));
+  if (bitRead(status, TEMP_OK)) DEBUG_PRINT(F("T "));
+  if (bitRead(status, SD_OK)) DEBUG_PRINT(F("S"));
+  DEBUG_PRINTLN(F(""));
+  DEBUG_PRINT(F("Buffer size: "));
+  DEBUG_PRINT(BUFFER_SIZE);
+  DEBUG_PRINTLN(F(" measurements"));
+}
+
+void takeMeasurement() {
+  static unsigned int measurementCount = 0;
+  measurementCount++;
+  
+  // Get timestamp
+  unsigned long unixTime = 0;
+  if (bitRead(status, RTC_OK)) {
+    DateTime now = rtc.now();
+    unixTime = now.unixtime();
+  }
+  
+  // Read temperature with 8-bit resolution
+  float temperature = -999;
+  if (bitRead(status, TEMP_OK)) {
+    temp.requestTemperatures();
+    delay(150);  // 8-bit conversion is faster
+    temperature = temp.getTempCByIndex(0);
+  }
+  
+  // Store in buffer instead of immediate SD write
+  if (temperature > -100) {
+    measurementBuffer[bufferIndex].timestamp = unixTime;
+    measurementBuffer[bufferIndex].temperature = temperature;
+    bufferIndex++;
+    
+    if (bufferIndex >= BUFFER_SIZE) {
+      bufferFull = true;
+      bufferIndex = 0;
+    }
+    
+    DEBUG_PRINT(F("#"));
+    DEBUG_PRINT(measurementCount);
+    DEBUG_PRINT(F(" T:"));
+    DEBUG_PRINT_DEC(temperature, 1);
+    DEBUG_PRINT(F("C Buf:"));
+    DEBUG_PRINT(bufferIndex);
+    DEBUG_PRINT(F("/"));
+    DEBUG_PRINTLN(BUFFER_SIZE);
+  }
+}
+
+void flushBufferToSD() {
+  if (!bitRead(status, SD_OK)) return;
+  
+  DEBUG_PRINTLN(F("Flushing buffer to SD..."));
+  
+  power_spi_enable();
+  File f = SD.open(F("temp.csv"), FILE_WRITE);
+  
+  if (f) {
+    // Write all buffered measurements
+    byte writeCount = bufferFull ? BUFFER_SIZE : bufferIndex;
+    
+    for (byte i = 0; i < writeCount; i++) {
+      f.print(measurementBuffer[i].timestamp);
+      f.print(F(","));
+      f.println(measurementBuffer[i].temperature, 1);
+    }
+    
+    f.close();
+    DEBUG_PRINT(F("Wrote "));
+    DEBUG_PRINT(writeCount);
+    DEBUG_PRINTLN(F(" measurements"));
+  } else {
+    DEBUG_PRINTLN(F("SD write failed!"));
+  }
+  
+  power_spi_disable();
+  
+  // Reset buffer
+  bufferFull = false;
+  bufferIndex = 0;
+}
+
+void enterDeepSleep() {
+  // Sleep for 30 minutes (225 x 8-second chunks)
+  for (int i = 0; i < 225; i++) {
+    LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+  }
+  
+  alarmTriggered = true;
+}
+
+// Emergency flush function (call before shutdown)
+void emergencyFlush() {
+  if (bufferIndex > 0) {
+    // Force flush any remaining data
+    flushBufferToSD();
+  }
+}
