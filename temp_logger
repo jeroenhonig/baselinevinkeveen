@@ -1,5 +1,5 @@
-// ULTRA GEOPTIMALISEERDE TEMPERATUURLOGGER - FIXED MACROS
-// Debug uitschakelen + bulk SD writes + 8-bit resolution
+// PRODUCTIE TEMPERATUURLOGGER - 24 UUR INTERVAL
+// Geen debug, geen buffer, ultra power saving
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -9,23 +9,7 @@
 #include <RTClib.h>
 #include <LowPower.h>
 #include <avr/power.h>
-
-// Debug mode (comment uit voor productie)
-#define DEBUG 1
-
-#ifdef DEBUG
-  #define DEBUG_PRINT(x) Serial.print(x)
-  #define DEBUG_PRINTLN(x) Serial.println(x)
-  #define DEBUG_BEGIN() Serial.begin(9600); delay(1000)
-  #define DEBUG_FLUSH() Serial.flush()
-  #define DEBUG_PRINT_DEC(x, d) Serial.print(x, d)  // Voor decimalen
-#else
-  #define DEBUG_PRINT(x)
-  #define DEBUG_PRINTLN(x)
-  #define DEBUG_BEGIN()
-  #define DEBUG_FLUSH()
-  #define DEBUG_PRINT_DEC(x, d)
-#endif
+#include <avr/wdt.h>
 
 // Pin definities
 #define ONE_WIRE_BUS 2
@@ -42,207 +26,179 @@ byte status = 0;
 #define TEMP_OK   1  
 #define SD_OK     2
 
-// Bulk write buffer - store measurements before writing to SD
-struct Measurement {
-  unsigned long timestamp;
-  float temperature;
-};
-
-const byte BUFFER_SIZE = 5;  // Store 5 measurements (2.5 hours)
-Measurement measurementBuffer[BUFFER_SIZE];
-byte bufferIndex = 0;
-bool bufferFull = false;
-
-volatile bool alarmTriggered = false;
+unsigned int measurementCount = 0;
 
 void setup() {
-  DEBUG_BEGIN();
-  DEBUG_PRINTLN(F("=== Ultra Optimized Logger ==="));
+  // Disable watchdog timer
+  wdt_disable();
   
-  // Disable unused peripherals
+  // Disable ALL unused peripherals for maximum power saving
   power_adc_disable();
-  power_spi_disable();
+  power_spi_disable();  // Re-enable when needed
   power_timer1_disable();
   power_timer2_disable();
+  power_usart0_disable();  // Disable Serial completely
   
   // Initialize components
   initializeComponents();
   
-  DEBUG_PRINTLN(F("Entering sleep mode..."));
-  DEBUG_FLUSH();
-  delay(100);
+  // Brief delay then start first measurement
+  delay(1000);
+  
+  // Take first measurement
+  takeMeasurement();
+  
+  // Enter main sleep loop
+  enter24HourSleep();
 }
 
 void loop() {
   // Take measurement
   takeMeasurement();
   
-  // Check if buffer is full or should be flushed
-  if (bufferFull) {
-    flushBufferToSD();
-  }
-  
-  DEBUG_PRINTLN(F("Sleeping..."));
-  DEBUG_FLUSH();
-  
-  // Sleep for 30 minutes
-  enterDeepSleep();
+  // Sleep for 24 hours
+  enter24HourSleep();
 }
 
 void initializeComponents() {
   // RTC initialization
-  DEBUG_PRINT(F("RTC... "));
   Wire.begin();
   if (rtc.begin()) {
     bitSet(status, RTC_OK);
-    DEBUG_PRINTLN(F("OK"));
     
+    // Set time if needed (only on first run)
     if (!rtc.isrunning()) {
-      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      // Set to current date/time (modify as needed)
+      rtc.adjust(DateTime(2025, 5, 12, 17, 0, 0));  // 12 mei 2025, 17:00
     }
-  } else {
-    DEBUG_PRINTLN(F("FAIL"));
   }
   
   // Temperature sensor initialization
-  DEBUG_PRINT(F("Temp... "));
   temp.begin();
-  temp.setResolution(8);  // 8-bit resolution = 0.5°C accuracy, ~150ms conversion
+  temp.setResolution(8);  // 8-bit = 0.5°C accuracy, fastest conversion
   
-  // Test temperature reading
+  // Test temperature
   temp.requestTemperatures();
   delay(200);
   float testTemp = temp.getTempCByIndex(0);
-  
   if (testTemp > -100) {
     bitSet(status, TEMP_OK);
-    DEBUG_PRINT(F("OK "));
-    DEBUG_PRINT_DEC(testTemp, 1);
-    DEBUG_PRINTLN(F("C (8-bit)"));
-  } else {
-    DEBUG_PRINTLN(F("FAIL"));
   }
   
   // SD card initialization
-  DEBUG_PRINT(F("SD... "));
   power_spi_enable();
   if (SD.begin(SD_CS_PIN)) {
     bitSet(status, SD_OK);
-    DEBUG_PRINTLN(F("OK"));
     
-    // Create header if file doesn't exist
-    File f = SD.open(F("temp.csv"), FILE_WRITE);
+    // Create/check log file
+    File f = SD.open(F("temp24.csv"), FILE_WRITE);
     if (f) {
       if (f.size() == 0) {
-        f.println(F("# Ultra Optimized Logger"));
-        f.println(F("# Bulk writes every 5 measurements"));
-        f.println(F("Timestamp,Temperature"));
+        f.println(F("# 24-Hour Temperature Logger"));
+        f.println(F("# Date,Time,Timestamp,Temperature"));
       }
       f.close();
     }
-  } else {
-    DEBUG_PRINTLN(F("FAIL"));
   }
   power_spi_disable();
-  
-  // Status summary
-  DEBUG_PRINT(F("Status: "));
-  if (bitRead(status, RTC_OK)) DEBUG_PRINT(F("R "));
-  if (bitRead(status, TEMP_OK)) DEBUG_PRINT(F("T "));
-  if (bitRead(status, SD_OK)) DEBUG_PRINT(F("S"));
-  DEBUG_PRINTLN(F(""));
-  DEBUG_PRINT(F("Buffer size: "));
-  DEBUG_PRINT(BUFFER_SIZE);
-  DEBUG_PRINTLN(F(" measurements"));
 }
 
 void takeMeasurement() {
-  static unsigned int measurementCount = 0;
   measurementCount++;
   
   // Get timestamp
   unsigned long unixTime = 0;
+  DateTime now;
   if (bitRead(status, RTC_OK)) {
-    DateTime now = rtc.now();
+    now = rtc.now();
     unixTime = now.unixtime();
   }
   
-  // Read temperature with 8-bit resolution
+  // Read temperature
   float temperature = -999;
   if (bitRead(status, TEMP_OK)) {
     temp.requestTemperatures();
-    delay(150);  // 8-bit conversion is faster
+    delay(200);  // Wait for 8-bit conversion
     temperature = temp.getTempCByIndex(0);
   }
   
-  // Store in buffer instead of immediate SD write
-  if (temperature > -100) {
-    measurementBuffer[bufferIndex].timestamp = unixTime;
-    measurementBuffer[bufferIndex].temperature = temperature;
-    bufferIndex++;
+  // Write directly to SD (no buffering)
+  if (bitRead(status, SD_OK) && temperature > -100) {
+    power_spi_enable();
+    File f = SD.open(F("temp24.csv"), FILE_WRITE);
     
-    if (bufferIndex >= BUFFER_SIZE) {
-      bufferFull = true;
-      bufferIndex = 0;
-    }
-    
-    DEBUG_PRINT(F("#"));
-    DEBUG_PRINT(measurementCount);
-    DEBUG_PRINT(F(" T:"));
-    DEBUG_PRINT_DEC(temperature, 1);
-    DEBUG_PRINT(F("C Buf:"));
-    DEBUG_PRINT(bufferIndex);
-    DEBUG_PRINT(F("/"));
-    DEBUG_PRINTLN(BUFFER_SIZE);
-  }
-}
-
-void flushBufferToSD() {
-  if (!bitRead(status, SD_OK)) return;
-  
-  DEBUG_PRINTLN(F("Flushing buffer to SD..."));
-  
-  power_spi_enable();
-  File f = SD.open(F("temp.csv"), FILE_WRITE);
-  
-  if (f) {
-    // Write all buffered measurements
-    byte writeCount = bufferFull ? BUFFER_SIZE : bufferIndex;
-    
-    for (byte i = 0; i < writeCount; i++) {
-      f.print(measurementBuffer[i].timestamp);
+    if (f) {
+      // Write human-readable date/time and unix timestamp
+      if (bitRead(status, RTC_OK)) {
+        // Format: 2025-05-12,17:30:00,timestamp,temperature
+        f.print(now.year());
+        f.print(F("-"));
+        if (now.month() < 10) f.print(F("0"));
+        f.print(now.month());
+        f.print(F("-"));
+        if (now.day() < 10) f.print(F("0"));
+        f.print(now.day());
+        f.print(F(","));
+        
+        if (now.hour() < 10) f.print(F("0"));
+        f.print(now.hour());
+        f.print(F(":"));
+        if (now.minute() < 10) f.print(F("0"));
+        f.print(now.minute());
+        f.print(F(":"));
+        if (now.second() < 10) f.print(F("0"));
+        f.print(now.second());
+        f.print(F(","));
+        
+        f.print(unixTime);
+      } else {
+        f.print(F("NO_RTC,NO_TIME,0"));
+      }
+      
       f.print(F(","));
-      f.println(measurementBuffer[i].temperature, 1);
+      f.println(temperature, 1);
+      f.close();
     }
     
-    f.close();
-    DEBUG_PRINT(F("Wrote "));
-    DEBUG_PRINT(writeCount);
-    DEBUG_PRINTLN(F(" measurements"));
-  } else {
-    DEBUG_PRINTLN(F("SD write failed!"));
+    power_spi_disable();
   }
   
-  power_spi_disable();
-  
-  // Reset buffer
-  bufferFull = false;
-  bufferIndex = 0;
+  // Optional: Brief LED flash to indicate measurement taken
+  // pinMode(LED_BUILTIN, OUTPUT);
+  // digitalWrite(LED_BUILTIN, HIGH);
+  // delay(100);
+  // digitalWrite(LED_BUILTIN, LOW);
 }
 
-void enterDeepSleep() {
-  // Sleep for 30 minutes (225 x 8-second chunks)
-  for (int i = 0; i < 225; i++) {
+void enter24HourSleep() {
+  // 24 hours = 24 * 60 * 60 = 86400 seconds
+  // 86400 / 8 = 10800 sleep cycles
+  
+  for (unsigned int i = 0; i < 10800; i++) {
+    // Enter deepest power-down mode
     LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+    
+    // Check for early wake-up (optional)
+    // if (digitalRead(SOME_WAKE_PIN) == LOW) break;
   }
-  
-  alarmTriggered = true;
 }
 
-// Emergency flush function (call before shutdown)
-void emergencyFlush() {
-  if (bufferIndex > 0) {
-    // Force flush any remaining data
-    flushBufferToSD();
-  }
+// Power failure detection (optional)
+void setupPowerFailureDetection() {
+  // Monitor power supply and take emergency measurement
+  // Set up interrupt on power-down signal
+  // Not implemented - requires additional circuitry
+}
+
+// Calibration function (optional)
+void calibrateTemperatureSensor() {
+  // Store calibration offset in EEPROM if needed
+  // temp.setOffset(calibrationValue);
+}
+
+// Low battery warning (optional - requires voltage divider)
+bool checkBatteryVoltage() {
+  // Read battery voltage via analog pin
+  // Return true if voltage too low
+  return false;  // Not implemented
 }
