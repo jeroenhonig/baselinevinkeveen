@@ -1,5 +1,5 @@
 // PRODUCTIE TEMPERATUURLOGGER - 24 UUR INTERVAL
-// Geen debug, geen buffer, ultra power saving
+// Automatische tijd van compile time
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -66,11 +66,14 @@ void initializeComponents() {
   if (rtc.begin()) {
     bitSet(status, RTC_OK);
     
-    // Set time if needed (only on first run)
-    if (!rtc.isrunning()) {
-      // Set to current date/time (modify as needed)
-      rtc.adjust(DateTime(2025, 5, 12, 17, 0, 0));  // 12 mei 2025, 17:00
-    }
+    // Always update time on startup to compile time
+    // This automatically sets the current time when you upload
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    
+    // Optional: Add 10 seconds to compensate for upload delay
+    // DateTime compileTime = DateTime(F(__DATE__), F(__TIME__));
+    // DateTime adjustedTime = compileTime + TimeSpan(0, 0, 0, 10);
+    // rtc.adjust(adjustedTime);
   }
   
   // Temperature sensor initialization
@@ -95,6 +98,11 @@ void initializeComponents() {
     if (f) {
       if (f.size() == 0) {
         f.println(F("# 24-Hour Temperature Logger"));
+        f.println(F("# Auto-sync to compile time"));
+        f.print(F("# Started: "));
+        f.print(F(__DATE__));
+        f.print(F(" "));
+        f.println(F(__TIME__));
         f.println(F("# Date,Time,Timestamp,Temperature"));
       }
       f.close();
@@ -183,22 +191,19 @@ void enter24HourSleep() {
   }
 }
 
-// Power failure detection (optional)
-void setupPowerFailureDetection() {
-  // Monitor power supply and take emergency measurement
-  // Set up interrupt on power-down signal
-  // Not implemented - requires additional circuitry
+// Alternative: Manual time setting function (if needed)
+void setManualTime(int year, int month, int day, int hour, int minute, int second) {
+  if (bitRead(status, RTC_OK)) {
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+  }
 }
 
-// Calibration function (optional)
-void calibrateTemperatureSensor() {
-  // Store calibration offset in EEPROM if needed
-  // temp.setOffset(calibrationValue);
-}
-
-// Low battery warning (optional - requires voltage divider)
-bool checkBatteryVoltage() {
-  // Read battery voltage via analog pin
-  // Return true if voltage too low
-  return false;  // Not implemented
+// Function to add compensation for upload delay
+void setTimeWithCompensation() {
+  if (bitRead(status, RTC_OK)) {
+    DateTime compileTime = DateTime(F(__DATE__), F(__TIME__));
+    // Add 10-30 seconds to compensate for compile + upload time
+    DateTime adjustedTime = compileTime + TimeSpan(0, 0, 0, 10);
+    rtc.adjust(adjustedTime);
+  }
 }
